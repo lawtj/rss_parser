@@ -64,16 +64,16 @@ async def get_pb_auth_token(client: httpx.AsyncClient) -> str:
     return response.json()["token"]
 
 
-async def check_url_exists(client: httpx.AsyncClient, url: str, token: str) -> dict | None:
-    """Check if URL already exists in PocketBase"""
+async def fetch_existing_urls(client: httpx.AsyncClient, token: str) -> set[str]:
+    """Fetch last 50 URLs from PocketBase for comparison"""
     response = await client.get(
         f"{POCKETBASE_URL}/api/collections/rss_feeds/records",
-        params={"filter": f'url="{url}"', "perPage": 1},
+        params={"sort": "-created", "perPage": 50},
         headers={"Authorization": token},
     )
     response.raise_for_status()
     items = response.json()["items"]
-    return items[0] if items else None
+    return {item["url"] for item in items}
 
 
 async def create_rss_record(client: httpx.AsyncClient, item: dict, token: str) -> dict:
@@ -156,12 +156,6 @@ async def send_pushbullet(client: httpx.AsyncClient, title: str, body: str):
 
 async def process_item(client: httpx.AsyncClient, item: dict, token: str):
     """Process a single RSS item"""
-    # Check if exists
-    existing = await check_url_exists(client, item["link"], token)
-    if existing:
-        print(f"Skipping existing: {item['title']}")
-        return
-
     # Create record
     record = await create_rss_record(client, item, token)
     print(f"Created record for: {item['title']}")
@@ -192,12 +186,20 @@ async def main():
         # Authenticate
         token = await get_pb_auth_token(client)
 
+        # Fetch existing URLs from PocketBase
+        existing_urls = await fetch_existing_urls(client, token)
+        print(f"Found {len(existing_urls)} existing URLs in PocketBase")
+
         # Fetch RSS
         items = await fetch_rss("https://www.thebottomline.org.uk/feed/")
         print(f"Found {len(items)} RSS items")
 
+        # Filter to only new items
+        new_items = [item for item in items if item["link"] not in existing_urls]
+        print(f"Found {len(new_items)} new items to process")
+
         # Process items
-        for item in items:
+        for item in new_items:
             try:
                 await process_item(client, item, token)
                 await asyncio.sleep(1)  # Rate limiting
