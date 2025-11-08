@@ -61,40 +61,62 @@ async def get_pb_auth_token(client: httpx.AsyncClient) -> str:
         json={"identity": PB_EMAIL, "password": PB_PASSWORD},
     )
     response.raise_for_status()
-    return response.json()["token"]
+    try:
+        return response.json()["token"]
+    except Exception as e:
+        print(f"ERROR parsing auth response: {e}")
+        print(f"Response status: {response.status_code}")
+        print(f"Response text: {response.text}")
+        raise
 
 
 async def fetch_existing_urls(client: httpx.AsyncClient, token: str) -> set[str]:
     """Fetch last 50 URLs from PocketBase for comparison"""
+    print("DEBUG: Fetching existing URLs from PocketBase")
     response = await client.get(
         f"{POCKETBASE_URL}/api/collections/rss_feeds/records",
         params={"sort": "-created", "perPage": 50},
         headers={"Authorization": token},
     )
     response.raise_for_status()
-    items = response.json()["items"]
-    return {item["url"] for item in items}
+    try:
+        items = response.json()["items"]
+        return {item["url"] for item in items}
+    except Exception as e:
+        print(f"ERROR parsing fetch_existing_urls response: {e}")
+        print(f"Response status: {response.status_code}")
+        print(f"Response text: {response.text}")
+        raise
 
 
-async def create_rss_record(client: httpx.AsyncClient, item: dict, token: str) -> dict:
+async def create_rss_record(
+    client: httpx.AsyncClient, item: dict, token: str, summary: str | None = None, markdown: str | None = None
+) -> dict:
     """Create new RSS record in PocketBase"""
+    print(f"DEBUG: Creating RSS record for {item['link']}")
+    data = {
+        "url": item["link"],
+        "feed_url": item["link"],
+        "published_at": item["pubDate"],
+    }
+    if summary:
+        data["summary"] = summary
+    if markdown:
+        data["markdown"] = markdown
+
     response = await client.post(
         f"{POCKETBASE_URL}/api/collections/rss_feeds/records",
-        json={"url": item["link"], "feed_url": item["link"], "published_at": item["pubDate"]},
+        json=data,
         headers={"Authorization": token},
     )
     response.raise_for_status()
-    return response.json()
-
-
-async def update_rss_record(client: httpx.AsyncClient, record_id: str, summary: str, markdown: str, token: str):
-    """Update record with summary and markdown"""
-    response = await client.patch(
-        f"{POCKETBASE_URL}/api/collections/rss_feeds/records/{record_id}",
-        json={"summary": summary, "markdown": markdown},
-        headers={"Authorization": token},
-    )
-    response.raise_for_status()
+    try:
+        return response.json()
+    except Exception as e:
+        print(f"ERROR parsing create_rss_record response: {e}")
+        print(f"Response status: {response.status_code}")
+        print(f"Response text: {response.text}")
+        raise
 
 
 async def fetch_rss(url: str) -> list[dict]:
@@ -112,12 +134,14 @@ async def fetch_rss(url: str) -> list[dict]:
 
 async def scrape_markdown(client: httpx.AsyncClient, url: str) -> str:
     """Scrape article content as markdown"""
+    print(f"DEBUG: Scraping markdown for {url}")
     response = await client.get(
         f"{READER_API_URL}/{url}",
         headers={"Authorization": f"Bearer {READER_BEARER_TOKEN}", "X-Respond-With": "markdown"},
     )
     response.raise_for_status()
-    return response.json()["data"]
+    # The API returns plain markdown text, not JSON
+    return response.text
 
 
 async def generate_summary(markdown: str) -> str:
@@ -156,22 +180,23 @@ async def send_pushbullet(client: httpx.AsyncClient, title: str, body: str):
 
 async def process_item(client: httpx.AsyncClient, item: dict, token: str):
     """Process a single RSS item"""
-    # Create record
-    record = await create_rss_record(client, item, token)
-    print(f"Created record for: {item['title']}")
+    print(f"Processing: {item['title']}")
 
-    # Only process evidence-updates
+    # Skip evidence-updates
     if "evidence-updates" in item["link"].lower():
         print(f"Skipping evidence-updates: {item['title']}")
+        # Create minimal record for evidence-updates
+        await create_rss_record(client, item, token)
+        print(f"Created record for: {item['title']}")
         return
 
-    # Scrape and summarize
-    print(f"Processing: {item['title']}")
+    # Scrape and summarize BEFORE creating record
     markdown = await scrape_markdown(client, item["link"])
     summary = await generate_summary(markdown)
 
-    # Update record
-    await update_rss_record(client, record["id"], summary, markdown, token)
+    # Only create record after all processing succeeds
+    await create_rss_record(client, item, token, summary=summary, markdown=markdown)
+    print(f"Created record for: {item['title']}")
 
     # Notify
     await send_pushbullet(client, "New Summary", summary)
