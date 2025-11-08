@@ -178,6 +178,20 @@ async def send_pushbullet(client: httpx.AsyncClient, title: str, body: str):
     response.raise_for_status()
 
 
+async def log_cron_run(client: httpx.AsyncClient, token: str, service: str, status: str):
+    """Log cron run to PocketBase cronlog collection"""
+    try:
+        response = await client.post(
+            f"{POCKETBASE_URL}/api/collections/cronlog/records",
+            json={"service": service, "status": status},
+            headers={"Authorization": token},
+        )
+        response.raise_for_status()
+        print(f"Logged to cronlog: {service} - {status}")
+    except Exception as e:
+        print(f"Failed to log to cronlog: {e}")
+
+
 async def process_item(client: httpx.AsyncClient, item: dict, token: str):
     """Process a single RSS item"""
     print(f"Processing: {item['title']}")
@@ -206,32 +220,53 @@ async def process_item(client: httpx.AsyncClient, item: dict, token: str):
 async def main():
     """Main execution"""
     print(f"Starting RSS processing at {datetime.now()}")
+    service_name = "rss-parser"
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # Authenticate
-        token = await get_pb_auth_token(client)
+        token = None
+        try:
+            # Authenticate
+            token = await get_pb_auth_token(client)
 
-        # Fetch existing URLs from PocketBase
-        existing_urls = await fetch_existing_urls(client, token)
-        print(f"Found {len(existing_urls)} existing URLs in PocketBase")
+            # Fetch existing URLs from PocketBase
+            existing_urls = await fetch_existing_urls(client, token)
+            print(f"Found {len(existing_urls)} existing URLs in PocketBase")
 
-        # Fetch RSS
-        items = await fetch_rss("https://www.thebottomline.org.uk/feed/")
-        print(f"Found {len(items)} RSS items")
+            # Fetch RSS
+            items = await fetch_rss("https://www.thebottomline.org.uk/feed/")
+            print(f"Found {len(items)} RSS items")
 
-        # Filter to only new items
-        new_items = [item for item in items if item["link"] not in existing_urls]
-        print(f"Found {len(new_items)} new items to process")
+            # Filter to only new items
+            new_items = [item for item in items if item["link"] not in existing_urls]
+            print(f"Found {len(new_items)} new items to process")
 
-        # Process items
-        for item in new_items:
-            try:
-                await process_item(client, item, token)
-                await asyncio.sleep(1)  # Rate limiting
-            except Exception as e:
-                print(f"Error processing {item['title']}: {e}")
+            # Process items
+            errors = []
+            for item in new_items:
+                try:
+                    await process_item(client, item, token)
+                    await asyncio.sleep(1)  # Rate limiting
+                except Exception as e:
+                    error_msg = f"Error processing {item['title']}: {e}"
+                    print(error_msg)
+                    errors.append(error_msg)
 
-        print("Processing complete")
+            # Log success or partial success
+            if errors:
+                status = f"Completed with {len(errors)} error(s): {'; '.join(errors[:3])}"  # Log first 3 errors
+            else:
+                status = f"Success: Processed {len(new_items)} new items"
+
+            await log_cron_run(client, token, service_name, status)
+            print("Processing complete")
+
+        except Exception as e:
+            error_status = f"Failed: {str(e)}"
+            print(f"Fatal error: {e}")
+            # Try to log failure if we have a token
+            if token:
+                await log_cron_run(client, token, service_name, error_status)
+            raise
 
 
 if __name__ == "__main__":
